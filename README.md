@@ -66,7 +66,7 @@ the "missing required module 'RxCocoaRuntime'" SwiftPM error.
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/mdata-group/rxswift-dynamic-xcframework", exact: "6.7.0"),
+    .package(url: "https://github.com/mdata-group/rxswift-dynamic-xcframework", exact: "6.8.0-xcode26.2"),
 ],
 targets: [
     .target(name: "App", dependencies: [
@@ -100,6 +100,17 @@ Each xcframework contains:
 
 Built with `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` (stable `.swiftinterface`).
 
+### Privacy manifests
+
+`RxSwift` and `RxCocoa` are on Apple's list of commonly used third-party SDKs, so the consuming app has to ship their
+privacy manifests. Upstream (RxSwift 6.8.0+) declares them via SwiftPM `.copy("PrivacyInfo.xcprivacy")` under
+`Sources/<module>/`, which `Rx.xcodeproj`'s framework targets never reference — an `xcodebuild archive` would drop them.
+`build.sh` therefore copies each upstream manifest to its **framework bundle root**
+(`RxSwift.framework/PrivacyInfo.xcprivacy`), where Apple's privacy report reads it from for a framework.
+
+`RxSwift`, `RxRelay` and `RxCocoa` carry a manifest; `RxTest` / `RxBlocking` have none upstream (they never ship in an
+App Store build). RxSwift **6.7.0 and earlier have no manifests at all** — use 6.8.0 or newer.
+
 ## How it's built / how to update to a new RxSwift version
 
 Everything is produced by [`build.sh`](build.sh) — no manual steps, fully reproducible:
@@ -107,30 +118,35 @@ Everything is produced by [`build.sh`](build.sh) — no manual steps, fully repr
 ```bash
 ./build.sh <rxswift-version>
 # e.g.
-./build.sh 6.7.0
+./build.sh 6.8.0
 ```
 
 `build.sh`:
 1. Clones the **official** `ReactiveX/RxSwift` at the exact tag (`--branch <version>`).
 2. Archives each module (`RxSwift`, `RxRelay`, `RxCocoa`, `RxTest`, `RxBlocking`) from RxSwift's own `Rx.xcodeproj`
    framework schemes, for **device** and **simulator**, with library evolution.
-3. Assembles the five `.xcframework`s (device + arm64/x86_64 simulator).
-4. Zips each, computes the SwiftPM checksum.
-5. Regenerates `Package.swift` with the release URL + checksums for that tag.
-6. Verifies each xcframework has both slices and that `RxCocoa` `@rpath`-links `RxSwift`.
+3. Injects the upstream `PrivacyInfo.xcprivacy` of each module into its framework bundle root.
+4. Assembles the five `.xcframework`s (device + arm64/x86_64 simulator).
+5. Zips each, computes the SwiftPM checksum.
+6. Regenerates `Package.swift` with the release URL + checksums for that tag.
+7. Verifies each xcframework has both slices, that `RxCocoa` `@rpath`-links `RxSwift`, and that the manifests are in place.
 
 To publish a new version:
 
 ```bash
-./build.sh 6.8.0                       # or whatever the new RxSwift tag is
+# Pick the Xcode that will produce the .swiftinterface, and tag accordingly.
+DEVELOPER_DIR=/Applications/Xcode-26.2.0.app/Contents/Developer \
+RELEASE_TAG=6.8.0-xcode26.2 ./build.sh 6.8.0
 git add build.sh Package.swift README.md
-git commit -m "RxSwift 6.8.0 dynamic xcframeworks"
-git tag 6.8.0 && git push --tags
-gh release create 6.8.0 release/*.xcframework.zip --title "RxSwift 6.8.0 (dynamic xcframeworks)"
+git commit -m "RxSwift 6.8.0 dynamic xcframeworks (6.8.0-xcode26.2)"
+git tag 6.8.0-xcode26.2 && git push --tags
+gh release create 6.8.0-xcode26.2 release/*.xcframework.zip \
+  --title "RxSwift 6.8.0 (dynamic xcframeworks, Xcode 26.2)"
 ```
 
-The release **tag equals the upstream RxSwift version**, so consumers pin the RxSwift version they want via
-`exact: "<version>"`.
+The prebuilt `.swiftinterface` is tied to the Swift toolchain that produced it, so the release tag is
+`<rxswift-version>-xcode<xcode-version>` (`RELEASE_TAG`, defaults to the bare version). Consumers pin the exact pair they
+want via `exact: "<rxswift-version>-xcode<xcode-version>"`.
 
 ## Requirements
 

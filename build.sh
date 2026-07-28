@@ -13,8 +13,9 @@
 #
 # This script is fully reproducible: it clones the official RxSwift at an exact
 # tag, builds device + simulator (arm64 & x86_64) slices with library
-# evolution, assembles xcframeworks, zips them, computes SwiftPM checksums, and
-# regenerates Package.swift. Re-run it with a new tag to update.
+# evolution, injects the upstream privacy manifests, assembles xcframeworks,
+# zips them, computes SwiftPM checksums, and regenerates Package.swift. Re-run
+# it with a new tag to update.
 #
 # Usage:   ./build.sh <rxswift-version> [github-owner/repo]
 # Example: ./build.sh 6.7.0
@@ -46,7 +47,7 @@ git clone --quiet --depth 1 --branch "$VERSION" https://github.com/ReactiveX/RxS
 COMMON=(SKIP_INSTALL=NO BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
         "IPHONEOS_DEPLOYMENT_TARGET=$MIN_IOS" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO)
 
-echo "==> 2/5 archive each module (device + simulator) as dynamic frameworks"
+echo "==> 2/6 archive each module (device + simulator) as dynamic frameworks"
 cd "$SRC"
 for M in "${MODULES[@]}"; do
   echo "    - $M (iphoneos)"
@@ -57,7 +58,26 @@ for M in "${MODULES[@]}"; do
     -destination 'generic/platform=iOS Simulator' -archivePath "$WORK/$M-sim" "${COMMON[@]}" >/dev/null
 done
 
-echo "==> 3/5 create xcframeworks"
+# RxSwift/RxCocoa are on Apple's list of commonly used third-party SDKs, so the
+# consuming app has to ship their privacy manifests. Upstream (6.8.0+) declares
+# them via SwiftPM `.copy("PrivacyInfo.xcprivacy")` under Sources/<module>/ —
+# Rx.xcodeproj's targets never reference those files, so an xcodebuild archive
+# drops them. Copy each manifest to its framework bundle root, which is where
+# Apple's privacy report reads it from for a framework.
+echo "==> 3/6 inject upstream PrivacyInfo.xcprivacy"
+for M in "${MODULES[@]}"; do
+  MANIFEST="$SRC/Sources/$M/PrivacyInfo.xcprivacy"
+  if [ ! -f "$MANIFEST" ]; then
+    echo "    - $M: none upstream, skipped"
+    continue
+  fi
+  for SLICE in ios sim; do
+    cp "$MANIFEST" "$WORK/$M-$SLICE.xcarchive/Products/Library/Frameworks/$M.framework/PrivacyInfo.xcprivacy"
+  done
+  echo "    - $M: injected (device + simulator)"
+done
+
+echo "==> 4/6 create xcframeworks"
 for M in "${MODULES[@]}"; do
   xcodebuild -create-xcframework \
     -framework "$WORK/$M-ios.xcarchive/Products/Library/Frameworks/$M.framework" \
@@ -66,7 +86,7 @@ for M in "${MODULES[@]}"; do
   echo "    - $M.xcframework: $(ls "$XCF/$M.xcframework" | grep -v Info.plist | tr '\n' ' ')"
 done
 
-echo "==> 4/5 zip + checksum"
+echo "==> 5/6 zip + checksum"
 # bash 3.2 (stock macOS) has no associative arrays; keep a "<module> <sha>" table.
 SUMFILE="$WORK/checksums.txt"; : > "$SUMFILE"
 for M in "${MODULES[@]}"; do
@@ -77,7 +97,7 @@ for M in "${MODULES[@]}"; do
 done
 sumfor() { awk -v m="$1" '$1==m{print $2}' "$SUMFILE"; }
 
-echo "==> 5/5 generate Package.swift"
+echo "==> 6/6 generate Package.swift"
 BASE="https://github.com/$REPO/releases/download/$REL_TAG"
 {
   echo "// swift-tools-version: 5.9"
@@ -108,6 +128,14 @@ for M in "${MODULES[@]}"; do
   echo "    $M: $slices"
 done
 echo "    RxCocoa deps:"; otool -L "$XCF/RxCocoa.xcframework/ios-arm64/RxCocoa.framework/RxCocoa" | grep -oE "@rpath/Rx[A-Za-z]+\.framework" | sort -u | sed 's/^/      /'
+echo "    privacy manifests:"
+for M in "${MODULES[@]}"; do
+  for SLICE in "$XCF/$M.xcframework"/*/; do
+    [ -d "$SLICE$M.framework" ] || continue
+    if [ -f "$SLICE$M.framework/PrivacyInfo.xcprivacy" ]; then STATE="present"; else STATE="ABSENT"; fi
+    echo "      $M/$(basename "$SLICE"): $STATE"
+  done
+done
 
 echo ""
 echo "DONE. Next steps:"
