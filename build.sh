@@ -1,112 +1,102 @@
 #!/bin/bash
 # =============================================================================
-# build.sh — convert official ReactiveX/RxSwift into DYNAMIC .xcframeworks
+# build.sh — repackage the OFFICIAL RxSwift .xcframework release for SwiftPM
 # =============================================================================
-# Why: on Xcode 26/27 the iOS Simulator is arm64-only (Rosetta/x86_64 sims were
-# removed). Consuming RxSwift as a *static* SwiftPM library then links a full
-# copy of RxSwift into BOTH the app and its xctest bundle; two copies of
-# RxSwift's Swift generic metadata in one process -> `getSuperclassMetadata`
-# SIGABRT (SR-12303). Building each RxSwift module as its own *dynamic*
-# framework (Carthage-style: RxCocoa.framework dynamically links
-# RxSwift.framework via @rpath) means the whole process shares exactly ONE
-# RxSwift — no duplication, no crash.
+# ReactiveX/RxSwift attaches a single `RxSwift.xcframework.zip` to its releases
+# containing all five xcframeworks (RxSwift, RxRelay, RxCocoa, RxTest,
+# RxBlocking). They are already *dynamic* (MH_DYLIB, RxCocoa/RxTest/RxBlocking
+# @rpath-link RxSwift.framework) and code-signed by the maintainer, which is
+# exactly what's needed to avoid the arm64-simulator dual-metadata crash
+# (SR-12303) — see README.
 #
-# This script is fully reproducible: it clones the official RxSwift at an exact
-# tag, builds device + simulator (arm64 & x86_64) slices with library
-# evolution, injects the upstream privacy manifests, assembles xcframeworks,
-# zips them, computes SwiftPM checksums, and regenerates Package.swift. Re-run
-# it with a new tag to update.
+# They can't be consumed as-is: SwiftPM does NOT match a binary artifact to its
+# target by name. Pointing five .binaryTargets at that one zip makes SwiftPM
+# pick an arbitrary xcframework for each ("multiple potential binary artifacts
+# found: ... using the one in .../RxRelay.xcframework"), so a target named
+# RxSwift silently gets RxRelay. This script therefore splits the official zip
+# into one zip per module, leaving each xcframework — and its signature —
+# byte-identical, and emits the matching Package.swift.
+#
+# Nothing is compiled here, so the output does not depend on the local Xcode.
+#
+# If a release ships no xcframework asset (6.10.2 did not), fall back to
+# ./build-from-source.sh, which builds the frameworks from source instead.
 #
 # Usage:   ./build.sh <rxswift-version> [github-owner/repo]
-# Example: ./build.sh 6.7.0
+# Example: ./build.sh 6.9.1
 # =============================================================================
 set -euo pipefail
 
 VERSION="${1:?usage: ./build.sh <rxswift-version> [owner/repo]}"
 REPO="${2:-mdata-group/rxswift-dynamic-xcframework}"
-# Release/download tag. Defaults to VERSION, but the prebuilt xcframeworks are
-# tied to the Swift toolchain that produced their .swiftinterface, so a rebuild
-# with a different Xcode must publish under a distinct tag (e.g. RELEASE_TAG=6.7.0-xcode26.2).
+# Release tag. Defaults to the upstream version, because the binaries ARE the
+# upstream binaries — unlike build-from-source.sh, whose output is tied to the
+# local toolchain and so needs a `-xcode<version>` suffix.
 REL_TAG="${RELEASE_TAG:-$VERSION}"
-MIN_IOS="${MIN_IOS:-15.0}"
+# Team ID of "Apple Distribution: Shai Mishali", the documented signer.
+# Override only if upstream legitimately changes signing identity.
+EXPECT_TEAM="${EXPECT_TEAM:-272EB7D3H3}"
 MODULES=(RxSwift RxRelay RxCocoa RxTest RxBlocking)
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 WORK="$ROOT/.build"
-SRC="$WORK/RxSwift"
 XCF="$ROOT/xcframeworks"
 REL="$ROOT/release"
 
-command -v xcodebuild >/dev/null || { echo "xcodebuild not found"; exit 1; }
-echo "Xcode: $(xcodebuild -version | tr '\n' ' ')"
+command -v gh >/dev/null || { echo "gh not found"; exit 1; }
 rm -rf "$WORK" "$XCF" "$REL"; mkdir -p "$WORK" "$XCF" "$REL"
 
-echo "==> 1/5 clone ReactiveX/RxSwift @ $VERSION"
-git clone --quiet --depth 1 --branch "$VERSION" https://github.com/ReactiveX/RxSwift "$SRC"
+echo "==> 1/5 download official ReactiveX/RxSwift $VERSION xcframework asset"
+gh release download "$VERSION" --repo ReactiveX/RxSwift \
+  --pattern "RxSwift.xcframework.zip" --dir "$WORK" \
+  || { echo "no xcframework asset on release $VERSION — use ./build-from-source.sh"; exit 1; }
 
-COMMON=(SKIP_INSTALL=NO BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
-        "IPHONEOS_DEPLOYMENT_TARGET=$MIN_IOS" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO)
-
-echo "==> 2/6 archive each module (device + simulator) as dynamic frameworks"
-cd "$SRC"
+echo "==> 2/5 unpack"
+unzip -q "$WORK/RxSwift.xcframework.zip" -d "$WORK/x"
+rm -rf "$WORK/x/__MACOSX"
 for M in "${MODULES[@]}"; do
-  echo "    - $M (iphoneos)"
-  xcodebuild archive -project Rx.xcodeproj -scheme "$M" \
-    -destination 'generic/platform=iOS' -archivePath "$WORK/$M-ios" "${COMMON[@]}" >/dev/null
-  echo "    - $M (iphonesimulator)"
-  xcodebuild archive -project Rx.xcodeproj -scheme "$M" \
-    -destination 'generic/platform=iOS Simulator' -archivePath "$WORK/$M-sim" "${COMMON[@]}" >/dev/null
+  [ -d "$WORK/x/$M.xcframework" ] || { echo "missing $M.xcframework in the official zip"; exit 1; }
+  mv "$WORK/x/$M.xcframework" "$XCF/"
+  echo "    - $M.xcframework: $(ls "$XCF/$M.xcframework" | grep -vE 'Info.plist|_CodeSignature' | tr '\n' ' ')"
 done
 
-# RxSwift/RxCocoa are on Apple's list of commonly used third-party SDKs, so the
-# consuming app has to ship their privacy manifests. Upstream (6.8.0+) declares
-# them via SwiftPM `.copy("PrivacyInfo.xcprivacy")` under Sources/<module>/ —
-# Rx.xcodeproj's targets never reference those files, so an xcodebuild archive
-# drops them. Copy each manifest to its framework bundle root, which is where
-# Apple's privacy report reads it from for a framework.
-echo "==> 3/6 inject upstream PrivacyInfo.xcprivacy"
+echo "==> 3/5 verify upstream signature (expect team $EXPECT_TEAM)"
 for M in "${MODULES[@]}"; do
-  MANIFEST="$SRC/Sources/$M/PrivacyInfo.xcprivacy"
-  if [ ! -f "$MANIFEST" ]; then
-    echo "    - $M: none upstream, skipped"
-    continue
+  # Capture once and parse from the variable: piping codesign into a sed that
+  # quits early (`q`, `head`) SIGPIPEs it, and `set -o pipefail` would then
+  # abort the script instead of reporting a signature mismatch.
+  info=$(codesign -dv --verbose=2 "$XCF/$M.xcframework" 2>&1)
+  team=$(printf '%s\n' "$info" | sed -n 's/^TeamIdentifier=//p')
+  auth=$(printf '%s\n' "$info" | sed -n 's/^Authority=//p' | sed -n '1p')
+  if [ "$team" != "$EXPECT_TEAM" ]; then
+    echo "    !! $M signed by team '$team', expected '$EXPECT_TEAM' — refusing to republish"
+    exit 1
   fi
-  for SLICE in ios sim; do
-    cp "$MANIFEST" "$WORK/$M-$SLICE.xcarchive/Products/Library/Frameworks/$M.framework/PrivacyInfo.xcprivacy"
-  done
-  echo "    - $M: injected (device + simulator)"
+  echo "    - $M: $auth"
 done
 
-echo "==> 4/6 create xcframeworks"
-for M in "${MODULES[@]}"; do
-  xcodebuild -create-xcframework \
-    -framework "$WORK/$M-ios.xcarchive/Products/Library/Frameworks/$M.framework" \
-    -framework "$WORK/$M-sim.xcarchive/Products/Library/Frameworks/$M.framework" \
-    -output "$XCF/$M.xcframework" >/dev/null
-  echo "    - $M.xcframework: $(ls "$XCF/$M.xcframework" | grep -v Info.plist | tr '\n' ' ')"
-done
-
-echo "==> 5/6 zip + checksum"
+echo "==> 4/5 zip per module + checksum"
 # bash 3.2 (stock macOS) has no associative arrays; keep a "<module> <sha>" table.
 SUMFILE="$WORK/checksums.txt"; : > "$SUMFILE"
 for M in "${MODULES[@]}"; do
   ( cd "$XCF" && zip -rqy "$REL/$M.xcframework.zip" "$M.xcframework" )
   sum=$(swift package compute-checksum "$REL/$M.xcframework.zip")
   echo "$M $sum" >> "$SUMFILE"
-  echo "    - $M.xcframework.zip  $sum"
+  printf "    - %-22s %8s  %s\n" "$M.xcframework.zip" "$(du -h "$REL/$M.xcframework.zip" | cut -f1)" "$sum"
 done
 sumfor() { awk -v m="$1" '$1==m{print $2}' "$SUMFILE"; }
 
-echo "==> 6/6 generate Package.swift"
+echo "==> 5/5 generate Package.swift"
 BASE="https://github.com/$REPO/releases/download/$REL_TAG"
 {
   echo "// swift-tools-version: 5.9"
-  echo "// AUTO-GENERATED by build.sh for RxSwift $VERSION. Do not edit by hand."
+  echo "// AUTO-GENERATED by build.sh from the official RxSwift $VERSION xcframework release."
+  echo "// Do not edit by hand."
   echo "import PackageDescription"
   echo ""
   echo "let package = Package("
   echo "    name: \"RxSwiftDynamic\","
-  echo "    platforms: [.iOS(\"$MIN_IOS\")],"
+  echo "    platforms: [.iOS(\"15.0\")],"
   echo "    products: ["
   for M in "${MODULES[@]}"; do echo "        .library(name: \"$M\", targets: [\"$M\"]),"; done
   echo "    ],"
@@ -122,23 +112,25 @@ BASE="https://github.com/$REPO/releases/download/$REL_TAG"
 } > "$ROOT/Package.swift"
 
 echo ""
-echo "==> verify (each: device ios-arm64 + ios-arm64_x86_64-simulator; RxCocoa @rpath-links RxSwift)"
+echo "==> verify"
+echo "    mach-o type (all must be DYLIB — a static slice would reintroduce SR-12303):"
 for M in "${MODULES[@]}"; do
-  slices=$(ls "$XCF/$M.xcframework" | grep -v Info.plist | tr '\n' ' ')
-  echo "    $M: $slices"
+  ft=$(otool -h "$XCF/$M.xcframework/ios-arm64/$M.framework/$M" 2>/dev/null | tail -1 | awk '{print $5}')
+  printf "      %-11s %s\n" "$M" "$([ "$ft" = 6 ] && echo "MH_DYLIB" || echo "filetype=$ft  !! NOT DYLIB")"
 done
-echo "    RxCocoa deps:"; otool -L "$XCF/RxCocoa.xcframework/ios-arm64/RxCocoa.framework/RxCocoa" | grep -oE "@rpath/Rx[A-Za-z]+\.framework" | sort -u | sed 's/^/      /'
+echo "    @rpath deps (each must link RxSwift.framework, not embed it):"
+for M in RxRelay RxCocoa RxTest RxBlocking; do
+  printf "      %-11s %s\n" "$M" "$(otool -L "$XCF/$M.xcframework/ios-arm64/$M.framework/$M" 2>/dev/null | grep -oE '@rpath/Rx[A-Za-z]+\.framework' | grep -v "^@rpath/$M\.framework$" | sort -u | tr '\n' ' ')"
+done
 echo "    privacy manifests:"
 for M in "${MODULES[@]}"; do
-  for SLICE in "$XCF/$M.xcframework"/*/; do
-    [ -d "$SLICE$M.framework" ] || continue
-    if [ -f "$SLICE$M.framework/PrivacyInfo.xcprivacy" ]; then STATE="present"; else STATE="ABSENT"; fi
-    echo "      $M/$(basename "$SLICE"): $STATE"
-  done
+  if [ -f "$XCF/$M.xcframework/ios-arm64/$M.framework/PrivacyInfo.xcprivacy" ]; then s="present"; else s="none upstream"; fi
+  printf "      %-11s %s\n" "$M" "$s"
 done
 
 echo ""
 echo "DONE. Next steps:"
-echo "  git add build.sh README.md Package.swift LICENSE .gitignore"
-echo "  git commit -m \"RxSwift $VERSION dynamic xcframeworks ($REL_TAG)\" && git tag $REL_TAG && git push --tags"
-echo "  gh release create $REL_TAG release/*.xcframework.zip --title \"RxSwift $VERSION (dynamic xcframeworks, $REL_TAG)\""
+echo "  git add build.sh build-from-source.sh README.md Package.swift"
+echo "  git commit -m \"RxSwift $VERSION dynamic xcframeworks (repackaged from official release)\""
+echo "  git tag $REL_TAG && git push origin main --tags"
+echo "  gh release create $REL_TAG release/*.xcframework.zip --title \"RxSwift $VERSION (official dynamic xcframeworks, repackaged)\""
